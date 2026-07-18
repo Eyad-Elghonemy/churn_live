@@ -36,10 +36,10 @@ API_BASE_URL = "https://eyadzz-churn-live.hf.space/"
 # --------------------------------------------------------------------------
 # Design tokens & theme
 # --------------------------------------------------------------------------
-INK = "#10161C"
-PANEL = "#171F27"
-PANEL_ALT = "#1D2731"
-BORDER = "rgba(201,162,39,0.18)"
+INK = "#000000"
+PANEL = "#0A0A0A"
+PANEL_ALT = "#111111"
+BORDER = "rgba(201,162,39,0.16)"
 BRASS = "#C9A227"
 BRASS_DIM = "#8A7220"
 TEAL = "#3FA796"
@@ -69,7 +69,7 @@ html, body, [class*="css"] {{
 }}
 
 .stApp {{
-    background: radial-gradient(circle at 15% 0%, #141B23 0%, {INK} 45%) fixed;
+    background: radial-gradient(circle at 15% 0%, #0A0A0A 0%, {INK} 45%) fixed;
     color: {TEXT};
 }}
 
@@ -382,6 +382,28 @@ def get_usage_stats(base_url: str, api_key: str, timeout=8):
         return False, str(e)
 
 
+def get_system_stats(base_url: str, api_key: str, timeout=8):
+    url = base_url.rstrip("/") + "/system"
+    headers = {"X-API-Key": api_key}
+    try:
+        r = requests.get(url, headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            return True, r.json()
+        try:
+            detail = r.json().get("detail", r.text)
+        except Exception:
+            detail = r.text
+        return False, f"HTTP {r.status_code}: {detail}"
+    except requests.exceptions.RequestException as e:
+        return False, str(e)
+
+
+def request_fingerprint(*parts) -> str:
+    """Stable hash of arbitrary JSON-able parts, used to detect repeat requests."""
+    raw = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
 def risk_band(prob: float):
     if prob < 0.33:
         return "low", "badge-low", TEAL
@@ -645,10 +667,22 @@ elif page == "Score a Customer":
             "IsActiveMember": 1 if is_active == "Yes" else 0,
             "EstimatedSalary": float(salary),
         }
-        with st.spinner("Calling the API..."):
-            success, result = call_predict(base_url, api_key, model_choice, payload)
+
+        last = st.session_state.get("last_single_request")
+        is_duplicate = last is not None and last["model"] == model_choice and last["payload"] == payload
+
+        if is_duplicate:
+            success, result = True, last["result"]
+            st.toast("Same inputs as your last request — reusing the cached result instead of calling the API again.", icon="♻️")
+        else:
+            with st.spinner("Calling the API..."):
+                success, result = call_predict(base_url, api_key, model_choice, payload)
+            if success:
+                st.session_state.last_single_request = {"model": model_choice, "payload": payload, "result": result}
 
         with result_col:
+            if is_duplicate:
+                st.info("♻️ Identical to your last request — showing the cached result (no API call made).")
             if not success:
                 st.error(f"Prediction failed: {result}")
             else:
@@ -671,15 +705,16 @@ elif page == "Score a Customer":
                 fig.update_yaxes(autorange="reversed")
                 st.plotly_chart(fig, use_container_width=True)
 
-                st.session_state.history.append(
-                    {
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                        "model": model_choice,
-                        "probability": prob,
-                        "prediction": "Churn" if pred else "Stay",
-                        **payload,
-                    }
-                )
+                if not is_duplicate:
+                    st.session_state.history.append(
+                        {
+                            "timestamp": datetime.now().strftime("%H:%M:%S"),
+                            "model": model_choice,
+                            "probability": prob,
+                            "prediction": "Churn" if pred else "Stay",
+                            **payload,
+                        }
+                    )
 
     if st.session_state.history:
         st.markdown('<hr class="rule">', unsafe_allow_html=True)
@@ -717,26 +752,36 @@ elif page == "Batch Scoring":
             else:
                 st.dataframe(df.head(), use_container_width=True)
                 if st.button(f"Score {len(df)} customers", use_container_width=True):
-                    results = []
-                    progress = st.progress(0.0, text="Scoring...")
-                    for i, row in df.iterrows():
-                        payload = {k: row[k] for k in CUSTOMER_FIELDS_HELP}
-                        # Coerce numeric types the API expects
-                        for k in ["CreditScore", "Age", "Tenure", "NumOfProducts", "HasCrCard", "IsActiveMember"]:
-                            payload[k] = int(payload[k])
-                        for k in ["Balance", "EstimatedSalary"]:
-                            payload[k] = float(payload[k])
+                    import hashlib
+                    batch_hash = hashlib.md5(uploaded.getvalue() + model_choice_b.encode()).hexdigest()
+                    last_batch = st.session_state.get("last_batch_request")
 
-                        success, result = call_predict(base_url, api_key, model_choice_b, payload)
-                        if success:
-                            results.append({**payload, "Churn_Prediction": result["Churn_Prediction"], "Churn_Probability": result["Churn_Probability"]})
-                        else:
-                            results.append({**payload, "Churn_Prediction": None, "Churn_Probability": None, "error": result})
-                        progress.progress((i + 1) / len(df), text=f"Scoring... {i+1}/{len(df)}")
-                    progress.empty()
+                    if last_batch is not None and last_batch["hash"] == batch_hash:
+                        res_df = last_batch["results"]
+                        st.toast("Same file and model as your last batch — reusing cached results instead of re-calling the API.", icon="♻️")
+                        st.info(f"♻️ This is the same CSV + model as your last batch run — showing the cached results for {len(res_df)} customers (no API calls made).")
+                    else:
+                        results = []
+                        progress = st.progress(0.0, text="Scoring...")
+                        for i, row in df.iterrows():
+                            payload = {k: row[k] for k in CUSTOMER_FIELDS_HELP}
+                            # Coerce numeric types the API expects
+                            for k in ["CreditScore", "Age", "Tenure", "NumOfProducts", "HasCrCard", "IsActiveMember"]:
+                                payload[k] = int(payload[k])
+                            for k in ["Balance", "EstimatedSalary"]:
+                                payload[k] = float(payload[k])
 
-                    res_df = pd.DataFrame(results)
-                    st.success(f"Scored {len(res_df)} customers.")
+                            success, result = call_predict(base_url, api_key, model_choice_b, payload)
+                            if success:
+                                results.append({**payload, "Churn_Prediction": result["Churn_Prediction"], "Churn_Probability": result["Churn_Probability"]})
+                            else:
+                                results.append({**payload, "Churn_Prediction": None, "Churn_Probability": None, "error": result})
+                            progress.progress((i + 1) / len(df), text=f"Scoring... {i+1}/{len(df)}")
+                        progress.empty()
+
+                        res_df = pd.DataFrame(results)
+                        st.session_state.last_batch_request = {"hash": batch_hash, "results": res_df}
+                        st.success(f"Scored {len(res_df)} customers.")
 
                     c1, c2 = st.columns(2)
                     valid = res_df.dropna(subset=["Churn_Probability"])
@@ -917,14 +962,24 @@ elif page == "Usage Analytics":
                     ts_df["date"] = ts_df["timestamp"].dt.date
                     daily = ts_df.groupby(["date", "model"]).size().reset_index(name="calls")
                     fig = go.Figure()
+                    def _hex_to_rgba(hex_color, alpha):
+                        h = hex_color.lstrip("#")
+                        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+                        return f"rgba({r},{g},{b},{alpha})"
+
                     for model_name, color in [("forest", TEAL), ("xgboost", BRASS)]:
-                        sub = daily[daily["model"] == model_name]
+                        sub = daily[daily["model"] == model_name].sort_values("date")
                         fig.add_trace(
-                            go.Bar(x=sub["date"], y=sub["calls"], name=model_name.title(), marker_color=color)
+                            go.Scatter(
+                                x=sub["date"], y=sub["calls"], name=model_name.title(),
+                                mode="lines", line=dict(color=color, width=2, shape="spline", smoothing=0.6),
+                                fill="tozeroy", fillcolor=_hex_to_rgba(color, 0.10),
+                            )
                         )
                     fig.update_layout(
-                        template=PLOTLY_TEMPLATE, height=320, barmode="stack",
+                        template=PLOTLY_TEMPLATE, height=320,
                         yaxis_title="Predictions", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        xaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.05)", griddash="dot"),
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
